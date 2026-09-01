@@ -1,0 +1,17 @@
+[project]
+name = "comfyui-h3-game-sprites"
+description = "ComfyUI node port of gary149/h3-game-sprites: turn AI-generated video into 2D game sprite sheets."
+version = "1.0.0"
+license = { file = "LICENSE" }
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["numpy", "Pillow"]
+
+[project.urls]
+Repository = "https://github.com/gunug/comfyui-h3-game-sprites"
+"Upstream project" = "https://github.com/gary149/h3-game-sprites"
+
+[tool.comfy]
+PublisherId = "gunug"
+DisplayName = "H3 Game Sprites"
+Icon = ""

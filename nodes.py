@@ -20,7 +20,7 @@ import os
 
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, ImageDraw
 
 import folder_paths
 
@@ -318,23 +318,48 @@ class SpriteAtlasBuild:
     def _sheet(self, rows, height, ground_y):
         """Draw every frame on a shared ground line, using the same placement
         math the runtime uses — this is the pixel check that the offsets are
-        right, not a metadata assertion."""
-        cell_w = max(120, int(height * 0.9))
-        cell_h = int(height * 1.35)
+        right, not a metadata assertion.
+
+        The cell is sized from the WIDEST placed extent, not from the reference
+        height: a kick reaches far past the ankle anchor, so a cell derived from
+        height alone lets one pose spill into its neighbour and the sheet stops
+        being readable.
+        """
+        pad = 16
+        tiles = [t for r in rows for t in r]
+        if not tiles:
+            return _to_image(np.zeros((1, 8, 8, 3), dtype=np.uint8))
+
+        # extents measured from the anchor (x) and the ground line (y), which is
+        # exactly where the runtime pins each frame
+        left = max(int(f["anchorOffset"]) - int(f["driftX"]) for _, f in tiles)
+        right = max(int(f["w"]) - int(f["anchorOffset"]) + int(f["driftX"]) for _, f in tiles)
+        up = max(int(f["h"]) - int(f["footOffset"]) for _, f in tiles)
+        down = max(0, max(int(f["footOffset"]) for _, f in tiles))
+
+        cell_w = max(int(height * 0.5), left + right) + pad * 2
+        cell_h = max(int(height * 0.6), up + down) + pad * 2
+        anchor_x = pad + max(left, 0)
+        ground = pad + max(up, 0)
+
         cols = max((len(r) for r in rows), default=1)
-        W, H = cell_w * max(cols, 1), cell_h * max(len(rows), 1)
+        W = cell_w * max(cols, 1)
+        H = cell_h * max(len(rows), 1)
         canvas = Image.new("RGBA", (max(W, 1), max(H, 1)), (28, 32, 41, 255))
-        ground = int(cell_h * 0.86)
-        for ri, tiles in enumerate(rows):
+        draw = ImageDraw.Draw(canvas)
+
+        for ri, row in enumerate(rows):
             y0 = ri * cell_h
-            for ci, (im, f) in enumerate(tiles):
-                x = ci * cell_w + cell_w // 2 + int(f["driftX"]) - int(f["anchorOffset"])
-                y = y0 + ground + int(f["footOffset"]) - int(f["h"])
-                canvas.alpha_composite(im, (max(x, 0), max(y, 0)))
-            for ci in range(cols):
-                for xx in range(ci * cell_w, (ci + 1) * cell_w):
-                    if 0 <= xx < canvas.width and 0 <= y0 + ground < canvas.height:
-                        canvas.putpixel((xx, y0 + ground), (90, 105, 140, 255))
+            gy = y0 + ground
+            draw.line([(0, gy), (canvas.width - 1, gy)], fill=(90, 105, 140, 255))
+            for ci, (im, f) in enumerate(row):
+                x = ci * cell_w + anchor_x + int(f["driftX"]) - int(f["anchorOffset"])
+                y = gy + int(f["footOffset"]) - int(f["h"])
+                canvas.alpha_composite(im, (x, y))
+            for ci in range(1, cols):
+                cx = ci * cell_w
+                draw.line([(cx, y0), (cx, y0 + cell_h - 1)], fill=(52, 58, 72, 255))
+
         arr = np.asarray(canvas.convert("RGB"))
         return _to_image(arr[None, ...])
 
@@ -417,12 +442,117 @@ class SpriteAtlasPlayer:
                 "result": (_to_image(np.stack(out)), report)}
 
 
+class SpriteRelight:
+    """Light a sprite with its normal map, so you can SEE the map working.
+
+    Lambert diffuse plus a Blinn-Phong highlight, composited over a flat
+    background through the alpha. The view vector is straight at the screen
+    (0,0,1), which is what a 2D engine assumes, so what you see here is what
+    Unity's Sprite Lit / Godot's CanvasItem normal maps will draw.
+
+    sweep_over_batch spins the light a full turn across the frame batch — the
+    fastest way to tell a correct normal map from a flat one, because a flat
+    map just changes brightness while a real one moves the shading.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "images": ("IMAGE",),
+            "normal": ("IMAGE",),
+            "alpha": ("MASK",),
+            "light_angle": ("FLOAT", {"default": 135.0, "min": 0.0, "max": 360.0, "step": 1.0}),
+            "light_height": ("FLOAT", {"default": 0.55, "min": 0.02, "max": 1.0, "step": 0.01}),
+            "light_color": ("STRING", {"default": "#fff2d0"}),
+            "intensity": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 4.0, "step": 0.05}),
+            "ambient": ("FLOAT", {"default": 0.35, "min": 0.0, "max": 1.0, "step": 0.05}),
+            "specular": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 2.0, "step": 0.05}),
+            "shininess": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 128.0, "step": 1.0}),
+            "flip_green": ("BOOLEAN", {"default": False}),
+            "sweep_over_batch": ("BOOLEAN", {"default": False}),
+            "background": ("STRING", {"default": "#1c2029"}),
+        }}
+
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("images", "report")
+    FUNCTION = "run"
+    CATEGORY = "sprites"
+
+    @staticmethod
+    def _hex(s, fallback=(28, 32, 41)):
+        try:
+            h = s.strip().lstrip("#")
+            return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+        except Exception:
+            return fallback
+
+    def run(self, images, normal, alpha, light_angle, light_height, light_color,
+            intensity, ambient, specular, shininess, flip_green, sweep_over_batch,
+            background):
+        rgb = images.detach().cpu().numpy().clip(0, 1).astype(np.float32)
+        nrm = normal.detach().cpu().numpy().clip(0, 1).astype(np.float32)
+        al = alpha.detach().cpu().numpy().clip(0, 1).astype(np.float32)
+
+        n = min(len(rgb), len(nrm), len(al))
+        if n == 0:
+            raise ValueError("no frames to light")
+        if rgb.shape[1:3] != nrm.shape[1:3]:
+            raise ValueError(
+                "albedo {}x{} and normal {}x{} differ — resize the normal map to the "
+                "frame size first".format(rgb.shape[2], rgb.shape[1], nrm.shape[2], nrm.shape[1]))
+        if rgb.shape[1:3] != al.shape[1:3]:
+            raise ValueError("albedo and alpha sizes differ")
+
+        lc = np.array(self._hex(light_color, (255, 242, 208)), dtype=np.float32) / 255.0
+        bg = np.array(self._hex(background), dtype=np.float32) / 255.0
+
+        out, flatness = [], []
+        for i in range(n):
+            # unpack the map into vectors; the green channel is +Y up in the
+            # OpenGL convention every 2D engine here uses, and image rows run
+            # DOWN, hence the sign on ny
+            v = nrm[i] * 2.0 - 1.0
+            nx = v[..., 0]
+            ny = -v[..., 1] if not flip_green else v[..., 1]
+            nz = np.abs(v[..., 2]) + 1e-6
+            ln = np.sqrt(nx * nx + ny * ny + nz * nz)
+            nx, ny, nz = nx / ln, ny / ln, nz / ln
+
+            deg = light_angle + (360.0 * i / n if sweep_over_batch else 0.0)
+            a = np.radians(deg % 360.0)
+            lx, ly, lz = np.cos(a), -np.sin(a), max(light_height, 0.02)
+            ll = np.sqrt(lx * lx + ly * ly + lz * lz)
+            lx, ly, lz = lx / ll, ly / ll, lz / ll
+
+            ndl = np.clip(nx * lx + ny * ly + nz * lz, 0.0, None)
+
+            hx, hy, hz = lx, ly, lz + 1.0
+            hl = np.sqrt(hx * hx + hy * hy + hz * hz)
+            ndh = np.clip((nx * hx + ny * hy + nz * hz) / hl, 0.0, None)
+            spec = specular * np.power(ndh, shininess)
+
+            lit = rgb[i] * (ambient + intensity * ndl)[..., None] * lc + spec[..., None] * lc
+            a_m = al[i][..., None]
+            out.append(np.clip(lit * a_m + bg * (1.0 - a_m), 0.0, 1.0))
+
+            m = al[i] > 0.5
+            flatness.append(float(ndl[m].std()) if m.any() else 0.0)
+
+        flat = float(np.mean(flatness))
+        report = ("frames {}  light {:.0f} deg  height {:.2f}  sweep {}\n"
+                  "shading variation {:.4f} — under about 0.02 the normal map is "
+                  "essentially flat and relighting will not read".format(
+                      n, light_angle, light_height, bool(sweep_over_batch), flat))
+        return (torch.from_numpy(np.stack(out)), report)
+
+
 NODE_CLASS_MAPPINGS = {
     "SpriteAutoKey": SpriteAutoKey,
     "SpriteSelectFrames": SpriteSelectFrames,
     "SpriteMove": SpriteMove,
     "SpriteAtlasBuild": SpriteAtlasBuild,
     "SpriteAtlasPlayer": SpriteAtlasPlayer,
+    "SpriteRelight": SpriteRelight,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -431,4 +561,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SpriteMove": "Sprite Move",
     "SpriteAtlasBuild": "Sprite Atlas Build",
     "SpriteAtlasPlayer": "Sprite Atlas Player",
+    "SpriteRelight": "Sprite Relight",
 }
